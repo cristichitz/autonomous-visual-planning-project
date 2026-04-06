@@ -6,11 +6,12 @@ from    torch.amp import autocast
 from    dataset import KittiStepDataset
 from    torch.utils.data import DataLoader
 from    model import MotionDeepLab
+from    stq   import STQuality
 import  os
 import  sys
 from matplotlib.colors import ListedColormap
 
-# Official Cityscapes / KITTI-STEP RGB colors (normalized to 0.0 - 1.0)
+# # Official Cityscapes / KITTI-STEP RGB colors (normalized to 0.0 - 1.0)
 cityscapes_colors = [
     [128/255,  64/255, 128/255],  # 0: road (Dark Purple)
     [244/255,  35/255, 232/255],  # 1: sidewalk (Magenta/Pink)
@@ -35,41 +36,84 @@ cityscapes_colors = [
 ]
 
 cityscapes_cmap = ListedColormap(cityscapes_colors)
+cityscapes_colors_255 = (np.array(cityscapes_colors) * 255).astype(np.uint8)
+
+def colorize_panoptic(panoptic_map, label_divisor=1000):
+    """
+    Colors background classes using standard Cityscapes palettes, 
+    and tracked instances using persistent random colors.
+    """
+    h, w = panoptic_map.shape
+    rgb_map = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    unique_ids = np.unique(panoptic_map)
+    for pan_id in unique_ids:
+        sem_id = pan_id // label_divisor
+        inst_id = pan_id % label_divisor
+        
+        mask = (panoptic_map == pan_id)
+        
+        if sem_id == 255 or sem_id >= 19: 
+            # Void / Ignore label
+            color = [0, 0, 0]
+        elif inst_id == 0:
+            # STUFF CLASS: Pull exact color from the official array
+            color = cityscapes_colors_255[sem_id]
+        else:
+            # THING CLASS: Unique persistent color based on the Panoptic ID
+            rng = np.random.RandomState(pan_id)
+            # Keeping the range 50-255 ensures instances are bright and punchy
+            color = rng.randint(50, 255, size=3) 
+            
+        rgb_map[mask] = color
+        
+    return rgb_map
 
 def visualize_prediction(image, predictions):
-    # 1. Prepare Semantic Map
-    sem_logits = predictions['semantic_logits'][0].cpu().numpy()
-    sem_pred = np.argmax(sem_logits, axis=0)
-    sem_pred[sem_pred == 255] = 19
+    """Renders a side-by-side comparison of the raw input and the panoptic tracking."""
+    # 1. Prepare Input Image
+    img_rgb = image.permute(1, 2, 0).cpu().numpy()
+    img_rgb = np.clip(img_rgb, 0, 1)
+    img_rgb_255 = (img_rgb * 255).astype(np.uint8)
 
-    
-    # 2. Prepare Center Heatmap
-    center_heat = torch.sigmoid(predictions['center_heatmap'][0, 0]).cpu().numpy()
-    
-    # 3. Prepare Motion Offsets (as HSV Optical Flow)
-    motion_yx = predictions['motion_offsets'][0].cpu().numpy()
-    mag, ang = cv2.cartToPolar(motion_yx[1], motion_yx[0])
-    hsv = np.zeros((motion_yx.shape[1], motion_yx.shape[2], 3), dtype=np.uint8)
-    hsv[..., 0] = ang * 180 / np.pi / 2
-    hsv[..., 1] = 255
-    hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)
-    motion_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    # 2. Prepare Panoptic Tracking Map
+    panoptic_tensor = predictions['panoptic_pred'][0].cpu().numpy()
+    panoptic_rgb = colorize_panoptic(panoptic_tensor, label_divisor=1000)
+
+    # Right: Alpha-blended Panoptic Overlay
+    # Blends 40% of the original image with 60% of the prediction map
+    blended = cv2.addWeighted(img_rgb_255, 0.4, panoptic_rgb, 0.6, 0)
+
+    unique_ids = np.unique(panoptic_tensor)
+    for pan_id in unique_ids:
+        sem_id = pan_id // 1000
+        inst_id = pan_id % 1000
+        if inst_id > 0 and sem_id < 19 and sem_id != 255:
+            y_coords, x_coords = np.where(panoptic_tensor == pan_id)
+
+            if len(x_coords) > 0:
+                center_x = int(np.mean(x_coords))
+                center_y = int(np.mean(y_coords))
+                text = str(inst_id)
+
+                cv2.putText(blended, text, (center_x, center_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0),3)
+                cv2.putText(blended, text, (center_x, center_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
     # Plotting
-    fig, axes = plt.subplots(2, 2, figsize=(20, 10))
+    fig, axes = plt.subplots(1, 2, figsize=(24, 8))
     
-    axes[0, 0].imshow(image.permute(1, 2, 0).cpu().numpy())
-    axes[0, 0].set_title("Input Frame")
+    # Left: Raw Dashcam
+    axes[0].imshow(img_rgb)
+    axes[0].set_title("Input Frame", fontsize=18)
+    axes[0].axis('off')
     
-    axes[0, 1].imshow(image.permute(1, 2, 0).cpu().numpy())
-    axes[0, 1].imshow(sem_pred, cmap=cityscapes_cmap, alpha=0.5, vmin=0, vmax=19)
-    axes[0, 1].set_title("Semantic Overlay")
+
     
-    axes[1, 0].imshow(center_heat, cmap='magma')
-    axes[1, 0].set_title("Instance Center Heatmap")
-    
-    axes[1, 1].imshow(motion_rgb)
-    axes[1, 1].set_title("Motion Vectors (HSV)")
+    axes[1].imshow(blended)
+    axes[1].set_title("Persistent Panoptic Tracking", fontsize=18)
+    axes[1].axis('off')
     
     plt.tight_layout()
     return fig
@@ -82,34 +126,46 @@ def fig_to_frame(fig):
     img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
     return img_bgr
 
-
 BATCH_SIZE = 4
 KITTI_STEP_ROOT = '.'
-MODEL_SAVE_PATH = 'weights/motion_deeplab_epoch_11.pth'
+MODEL_SAVE_PATH = 'weights/motion_deeplab_epoch_42.pth'
 
 val_ds = KittiStepDataset(root_dir=KITTI_STEP_ROOT, split='val')
 val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
 
+
+KITTI_THING_IDS = [11, 13]
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = MotionDeepLab().to(device)
+model = MotionDeepLab(thing_class_ids=KITTI_THING_IDS, label_divisor=1000).to(device)
 
 if os.path.exists(MODEL_SAVE_PATH):
-    model.load_state_dict(torch.load(MODEL_SAVE_PATH))
+    checkpoint = torch.load(MODEL_SAVE_PATH, weights_only=False)
+    if 'model_state' in checkpoint:
+        model.load_state_dict(checkpoint['model_state'], strict=False)
+    else:
+        model.load_state_dict(checkpoint, strict=False)
     print(f"✓ Model loaded from {MODEL_SAVE_PATH}")
 else:
     print(f"Error: Model weights not found at '{MODEL_SAVE_PATH}'.")
     sys.exit(1)
 
-print("Starting Video Evaluation...")
 model.eval()
 
 mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
 std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
 
-TARGET_SEQ = "0013"
-NUM_FRAMES = 250
-FPS = 5
+TARGET_SEQ = "0001"
+NUM_FRAMES = 350
+FPS = 10
 video_writer = None
+
+stq_metric = STQuality(
+    num_classes=19, 
+    things_list=KITTI_THING_IDS, 
+    ignore_label=255, 
+    max_instances_per_category=1000, 
+    offset=2**32
+)
 
 start_idx = None
 for idx, sample in enumerate(val_ds.samples):
@@ -117,55 +173,49 @@ for idx, sample in enumerate(val_ds.samples):
         start_idx = idx
         break
 
-# Bootstrapping the network's memory: Frame 1 has no previous heatmap, so it's blank.
-prev_predicted_heatmap = torch.zeros((1, 1, 384, 1248), device=device)
 if start_idx is None:
     print(f"Error: Sequence {TARGET_SEQ} not found in validation set!")
 else:
     print(f"Found {TARGET_SEQ} at index {start_idx}. Starting video generation...")
     with torch.no_grad():
         for i in range(start_idx, start_idx + NUM_FRAMES):
-            # We access val_ds directly to guarantee we get frames in chronological order
-            stacked_images, _, _, _ = val_ds[i]
+            stacked_images, y_true_semantic, y_true_instance, _ = val_ds[i]
+            images_6ch = stacked_images.unsqueeze(0).to(device)
+
+            # We combine semantic and instance GT into a single panoptic map
+            y_true = (y_true_semantic * 1000) + y_true_instance
+            y_true = y_true.to(device)
+
+            with autocast(device_type='cuda'):
+                predictions = model(images_6ch)
+
+            y_pred = predictions['panoptic_pred'].squeeze(0)
+            stq_metric.update_state(y_true=y_true, y_pred=y_pred, sequence_id=TARGET_SEQ)
             
-            # Add the batch dimension (Batch=1)
-            images = stacked_images.unsqueeze(0).to(device)
-            
-            # Concatenate 6 RGB channels with the 1 heatmap channel from the PREVIOUS loop
-            model_input = torch.cat([images, prev_predicted_heatmap], dim=1)
-            
-            # Forward pass
-            with autocast('cuda'):
-                predictions = model(model_input)
-                
-            # --- The Crucial Tracking Step ---
-            # Save this frame's center prediction so the NEXT frame can look at it
-            # prev_predicted_heatmap = torch.sigmoid(predictions['center_heatmap']).detach()
-            
-            # Un-normalize the RGB image for Matplotlib
-            curr_rgb = images[0, :3, :, :]
+            # Un-normalize the CURRENT RGB frame (first 3 channels) for Matplotlib
+            curr_rgb = images_6ch[0, :3, :, :]
             curr_rgb = curr_rgb * std + mean
             curr_rgb = torch.clamp(curr_rgb, 0, 1)
-            
-            # Draw the 2x2 grid
             fig = visualize_prediction(curr_rgb, predictions)
             frame_bgr = fig_to_frame(fig)
             
-            # Initialize the OpenCV VideoWriter on the first frame once we know the exact pixel dimensions
             if video_writer is None:
                 h, w, _ = frame_bgr.shape
-                video_writer = cv2.VideoWriter('outputs/evaluation_video2.mp4', 
+                video_writer = cv2.VideoWriter('outputs/evaluation_video5.mp4', 
                                             cv2.VideoWriter_fourcc(*'mp4v'), 
                                             FPS, (w, h))
                 
             video_writer.write(frame_bgr)
-            
-            # IMPORTANT: Close the figure to prevent your RAM from exploding
             plt.close(fig) 
             
             print(f"Processed frame {i + 1}/{start_idx + NUM_FRAMES}")
 
-# Save the file
 if video_writer:
     video_writer.release()
-print("✓ Video saved as evaluation_video.mp4")
+print("✓ Video saved as evaluation_video5.mp4")
+
+final_scores = stq_metric.result()
+print("\nFinal Evaluation Scores:")
+print(f"STQ: {final_scores['STQ']:.4f}")
+print(f"AQ:  {final_scores['AQ']:.4f}")
+print(f"SQ:  {final_scores['IoU']:.4f}")

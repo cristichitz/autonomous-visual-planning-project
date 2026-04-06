@@ -8,7 +8,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 class KittiStepDataset(Dataset):
-    def __init__(self, root_dir, split='train', image_size=(385, 1249)):
+    def __init__(self, root_dir, split='train', image_size=(384, 1248)):
         """
         Args:
             root_dir: Path to KITTI_STEP_ROOT
@@ -35,6 +35,8 @@ class KittiStepDataset(Dataset):
                     'sequence_id': sequence_id,
                     'frame_name': frame_name
                 })
+        print("Samples test: ", self.samples[0])
+
     def __len__(self):
         return len(self.samples)
     
@@ -44,6 +46,7 @@ class KittiStepDataset(Dataset):
         frame_name = sample['frame_name']
 
         frame_idx = int(frame_name.replace('.png', ''))
+        # Ex: images/train/0000/000000.png
         curr_img_path = os.path.join(self.img_dir, seq_id, frame_name)
         curr_panoptic_path = os.path.join(self.panoptic_dir, seq_id, frame_name)
 
@@ -58,7 +61,7 @@ class KittiStepDataset(Dataset):
         curr_img = Image.open(curr_img_path).convert('RGB')
         prev_img = Image.open(prev_img_path).convert('RGB')
         
-        fixed_size = (384, 1248)
+        fixed_size = self.image_size
 
         # Resize inputs
         curr_img = TF.resize(curr_img, fixed_size)

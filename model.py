@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 
 from   torchvision.models import resnet50, ResNet50_Weights
+from   post_processor import PanopticPostProcessor, MotionTracker
 
 
 class MotionDeepLabResNet50(nn.Module):
@@ -258,25 +259,88 @@ class MotionDeepLabDecoder(nn.Module):
         return results
     
 class MotionDeepLab(nn.Module):
-    def __init__(self):
+    def __init__(self, thing_class_ids, label_divisor=1000, void_label=255):
         super().__init__()
 
         self.encoder = MotionDeepLabResNet50()
         self.decoder = MotionDeepLabDecoder()
 
-    def forward(self, x):
-        features = self.encoder(x)
+        self.post_processor = PanopticPostProcessor(
+            thing_class_ids=thing_class_ids, 
+            label_divisor=label_divisor,
+            void_label=void_label
+        )
+        self.tracker = MotionTracker(
+            label_divisor=label_divisor, 
+            void_label=void_label
+        )
+        self.prev_center_heatmap = None
+
+    def forward(self, x, gt_prev_heatmap=None):
+        B, C, H, W = x.shape
+        frame1, frame2 = torch.split(x, [3, 3], dim=1)
+
+        if self.training:
+            if gt_prev_heatmap is None:
+                raise ValueError("Training requires gt_prev_heatmap for the 7th channel.")
+            x_7ch = torch.cat([x, gt_prev_heatmap], dim=1)
+        else:
+            # Use internal tracking memory during evaluation
+            frame1, frame2 = torch.split(x, [3, 3], dim=1)
+            if torch.all(frame1 == frame2) or self.prev_center_heatmap is None:
+                self.prev_center_heatmap = torch.zeros((B, 1, H, W), dtype=x.dtype, device=x.device)
+            x_7ch = torch.cat([x, self.prev_center_heatmap], dim=1)
+
+        features = self.encoder(x_7ch)
         results = self.decoder(features)
 
-        h_in, w_in = x.shape[2:]
         for key in results.keys():
             results[key] = F.interpolate(
-                results[key], size=(h_in, w_in), mode='bilinear', align_corners=False
+                results[key], size=(H, W), mode='bilinear', align_corners=False
             )
 
             if 'offset' in key:
-                scale_y = h_in / (h_in // 4)
-                scale_x = w_in / (w_in // 4)
+                scale_y = H / (H // 4)
+                scale_x = W / (W // 4)
                 results[key][:, 0, :, :] *= scale_y
                 results[key][:, 1, :, :] *= scale_x
+        
+        if self.training:
+            return results
+        
+        # --- Post-Processing Phase ---
+        panoptic_map, instance_map = self.post_processor(
+            semantic_logits=results['semantic_logits'],
+            center_heatmap=results['center_heatmap'],
+            offset_map=results['center_offsets']
+        )
+        
+        results['instance_pred'] = instance_map
+        
+        # This implementation assumes batch size of 1 for evaluation (standard for video processing)
+        if B == 1:
+            # Render new heatmap and extract geometric centers
+            next_heatmap, current_centers = self.tracker.render_panoptic_map_as_heatmap(panoptic_map[0])
+            
+            # Match current centers to previous ones and apply consistent IDs
+            tracked_panoptic_map = self.tracker.assign_instances_to_previous_tracks(
+                current_centers=current_centers,
+                heatmap=next_heatmap,
+                offsets=results['motion_offsets'][0],
+                panoptic_map=panoptic_map[0]
+            )
+            
+            results['panoptic_pred'] = tracked_panoptic_map.unsqueeze(0)
+            
+            # Save the clean heatmap to be used as the 7th channel in the next frame
+            self.prev_center_heatmap = next_heatmap.detach()
+        else:
+            results['panoptic_pred'] = panoptic_map # Fallback if B > 1
+
+        if 'center_heatmap' in results:
+            results['center_heatmap'] = results['center_heatmap'].squeeze(1)
+
         return results
+    
+    def update_tracking_state(self, new_center_heatmap):
+        self.prev_center = new_center_heatmap.detach().unsqueeze(1)

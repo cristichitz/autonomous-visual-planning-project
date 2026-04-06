@@ -5,6 +5,7 @@ motion-deeplab.py
 
 weights/*
 !weights/motion_deeplab_epoch_11.pth
+!weights/motion_deeplab_epoch_49.pth
 
 __pycache__/
 *.pyc
