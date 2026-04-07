@@ -285,7 +285,6 @@ class MotionDeepLab(nn.Module):
                 raise ValueError("Training requires gt_prev_heatmap for the 7th channel.")
             x_7ch = torch.cat([x, gt_prev_heatmap], dim=1)
         else:
-            # Use internal tracking memory during evaluation
             frame1, frame2 = torch.split(x, [3, 3], dim=1)
             if torch.all(frame1 == frame2) or self.prev_center_heatmap is None:
                 self.prev_center_heatmap = torch.zeros((B, 1, H, W), dtype=x.dtype, device=x.device)
@@ -308,7 +307,6 @@ class MotionDeepLab(nn.Module):
         if self.training:
             return results
         
-        # --- Post-Processing Phase ---
         panoptic_map, instance_map = self.post_processor(
             semantic_logits=results['semantic_logits'],
             center_heatmap=results['center_heatmap'],
@@ -317,22 +315,16 @@ class MotionDeepLab(nn.Module):
         
         results['instance_pred'] = instance_map
         
-        # This implementation assumes batch size of 1 for evaluation (standard for video processing)
         if B == 1:
-            # Render new heatmap and extract geometric centers
             next_heatmap, current_centers = self.tracker.render_panoptic_map_as_heatmap(panoptic_map[0])
             
-            # Match current centers to previous ones and apply consistent IDs
             tracked_panoptic_map = self.tracker.assign_instances_to_previous_tracks(
                 current_centers=current_centers,
                 heatmap=next_heatmap,
                 offsets=results['motion_offsets'][0],
                 panoptic_map=panoptic_map[0]
             )
-            
-            results['panoptic_pred'] = tracked_panoptic_map.unsqueeze(0)
-            
-            # Save the clean heatmap to be used as the 7th channel in the next frame
+            results['panoptic_pred'] = tracked_panoptic_map.unsqueeze(0) 
             self.prev_center_heatmap = next_heatmap.detach()
         else:
             results['panoptic_pred'] = panoptic_map # Fallback if B > 1

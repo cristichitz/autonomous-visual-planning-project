@@ -7,5 +7,7 @@ weights/*
 !weights/motion_deeplab_epoch_11.pth
 !weights/motion_deeplab_epoch_49.pth
 
+
+outputs/
 __pycache__/
 *.pyc

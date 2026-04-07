@@ -54,15 +54,11 @@ def colorize_panoptic(panoptic_map, label_divisor=1000):
         mask = (panoptic_map == pan_id)
         
         if sem_id == 255 or sem_id >= 19: 
-            # Void / Ignore label
             color = [0, 0, 0]
         elif inst_id == 0:
-            # STUFF CLASS: Pull exact color from the official array
             color = cityscapes_colors_255[sem_id]
         else:
-            # THING CLASS: Unique persistent color based on the Panoptic ID
             rng = np.random.RandomState(pan_id)
-            # Keeping the range 50-255 ensures instances are bright and punchy
             color = rng.randint(50, 255, size=3) 
             
         rgb_map[mask] = color
@@ -71,16 +67,13 @@ def colorize_panoptic(panoptic_map, label_divisor=1000):
 
 def visualize_prediction(image, predictions):
     """Renders a side-by-side comparison of the raw input and the panoptic tracking."""
-    # 1. Prepare Input Image
     img_rgb = image.permute(1, 2, 0).cpu().numpy()
     img_rgb = np.clip(img_rgb, 0, 1)
     img_rgb_255 = (img_rgb * 255).astype(np.uint8)
 
-    # 2. Prepare Panoptic Tracking Map
     panoptic_tensor = predictions['panoptic_pred'][0].cpu().numpy()
     panoptic_rgb = colorize_panoptic(panoptic_tensor, label_divisor=1000)
 
-    # Right: Alpha-blended Panoptic Overlay
     # Blends 40% of the original image with 60% of the prediction map
     blended = cv2.addWeighted(img_rgb_255, 0.4, panoptic_rgb, 0.6, 0)
 
@@ -101,15 +94,11 @@ def visualize_prediction(image, predictions):
                 cv2.putText(blended, text, (center_x, center_y), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
 
-    # Plotting
     fig, axes = plt.subplots(1, 2, figsize=(24, 8))
     
-    # Left: Raw Dashcam
     axes[0].imshow(img_rgb)
     axes[0].set_title("Input Frame", fontsize=18)
     axes[0].axis('off')
-    
-
     
     axes[1].imshow(blended)
     axes[1].set_title("Persistent Panoptic Tracking", fontsize=18)
@@ -126,96 +115,114 @@ def fig_to_frame(fig):
     img_bgr = cv2.cvtColor(img_rgba, cv2.COLOR_RGBA2BGR)
     return img_bgr
 
-BATCH_SIZE = 4
-KITTI_STEP_ROOT = '.'
-MODEL_SAVE_PATH = 'weights/motion_deeplab_epoch_42.pth'
+class MotionDeepLabEvaluator:
+    def __init__(self, weights_path, kitti_root='.'):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.kitti_root = kitti_root
+        self.thing_ids = [11, 13]
 
-val_ds = KittiStepDataset(root_dir=KITTI_STEP_ROOT, split='val')
-val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(3, 1, 1)
 
+        self._load_model(weights_path)
+    
+    def _load_model(self, path):
+        self.model = MotionDeepLab(thing_class_ids=self.thing_ids, label_divisor=1000).to(self.device)
+        if os.path.exists(path):
+            checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+            state_dict = checkpoint['model_state'] if 'model_state' in checkpoint else checkpoint
+            self.model.load_state_dict(state_dict, strict=False)
+            print(f"✓ Model loaded from {path}")
+        else:
+            print(f"Error: Model weights not found at '{path}'.")
+            sys.exit(1)
+        self.model.eval()
+    
+    def _get_start_idx(self, dataset, target_seq):
+        for idx, sample in enumerate(dataset.samples):
+            if sample['sequence_id'] == target_seq:
+                return idx
+        return None
+    
+    def evaluate_sequence(self, target_seq="0001", split='val', num_frames=350, fps=10, out_name='outputs/evaluation_video.mp4'):
+        dataset = KittiStepDataset(root_dir=self.kitti_root, split=split)
+        start_idx = self._get_start_idx(dataset, target_seq)
 
-KITTI_THING_IDS = [11, 13]
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = MotionDeepLab(thing_class_ids=KITTI_THING_IDS, label_divisor=1000).to(device)
+        if start_idx is None:
+            print(f"Error: Sequence {target_seq} not found in {split} set!")
+            return
+        
+        has_gt = (split == 'val')
+        if has_gt:
+            stq_metric = STQuality(
+                num_classes=19, things_list=self.thing_ids, 
+                ignore_label=255, max_instances_per_category=1000, offset=2**32
+            )
+        
+        video_writer = None
+        print(f"Starting inference on {target_seq} ({split} split)...")
+        
+        with torch.no_grad():
+            for i in range(start_idx, min(start_idx + num_frames, len(dataset))):
+                if has_gt:
+                    stacked_images, y_true_sem, y_true_inst, _ = dataset[i]
+                else:
+                    stacked_images = dataset[i]
 
-if os.path.exists(MODEL_SAVE_PATH):
-    checkpoint = torch.load(MODEL_SAVE_PATH, weights_only=False)
-    if 'model_state' in checkpoint:
-        model.load_state_dict(checkpoint['model_state'], strict=False)
-    else:
-        model.load_state_dict(checkpoint, strict=False)
-    print(f"✓ Model loaded from {MODEL_SAVE_PATH}")
-else:
-    print(f"Error: Model weights not found at '{MODEL_SAVE_PATH}'.")
-    sys.exit(1)
+                images_6ch = stacked_images.unsqueeze(0).to(self.device)
+                with autocast(device_type='cuda'):
+                    predictions = self.model(images_6ch)
 
-model.eval()
-
-mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
-std = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
-
-TARGET_SEQ = "0001"
-NUM_FRAMES = 350
-FPS = 10
-video_writer = None
-
-stq_metric = STQuality(
-    num_classes=19, 
-    things_list=KITTI_THING_IDS, 
-    ignore_label=255, 
-    max_instances_per_category=1000, 
-    offset=2**32
-)
-
-start_idx = None
-for idx, sample in enumerate(val_ds.samples):
-    if sample['sequence_id'] == TARGET_SEQ:
-        start_idx = idx
-        break
-
-if start_idx is None:
-    print(f"Error: Sequence {TARGET_SEQ} not found in validation set!")
-else:
-    print(f"Found {TARGET_SEQ} at index {start_idx}. Starting video generation...")
-    with torch.no_grad():
-        for i in range(start_idx, start_idx + NUM_FRAMES):
-            stacked_images, y_true_semantic, y_true_instance, _ = val_ds[i]
-            images_6ch = stacked_images.unsqueeze(0).to(device)
-
-            # We combine semantic and instance GT into a single panoptic map
-            y_true = (y_true_semantic * 1000) + y_true_instance
-            y_true = y_true.to(device)
-
-            with autocast(device_type='cuda'):
-                predictions = model(images_6ch)
-
-            y_pred = predictions['panoptic_pred'].squeeze(0)
-            stq_metric.update_state(y_true=y_true, y_pred=y_pred, sequence_id=TARGET_SEQ)
-            
-            # Un-normalize the CURRENT RGB frame (first 3 channels) for Matplotlib
-            curr_rgb = images_6ch[0, :3, :, :]
-            curr_rgb = curr_rgb * std + mean
-            curr_rgb = torch.clamp(curr_rgb, 0, 1)
-            fig = visualize_prediction(curr_rgb, predictions)
-            frame_bgr = fig_to_frame(fig)
-            
-            if video_writer is None:
-                h, w, _ = frame_bgr.shape
-                video_writer = cv2.VideoWriter('outputs/evaluation_video5.mp4', 
-                                            cv2.VideoWriter_fourcc(*'mp4v'), 
-                                            FPS, (w, h))
+                if has_gt:
+                    y_pred = predictions['panoptic_pred'].squeeze(0)
+                    y_true = ((y_true_sem * 1000) + y_true_inst).to(self.device)
+                    stq_metric.update_state(y_true=y_true, y_pred=y_pred, sequence_id=target_seq)
                 
-            video_writer.write(frame_bgr)
-            plt.close(fig) 
-            
-            print(f"Processed frame {i + 1}/{start_idx + NUM_FRAMES}")
+                curr_rgb = torch.clamp((images_6ch[0, :3, :, :] * self.std) + self.mean, 0, 1)
+                fig = visualize_prediction(curr_rgb, predictions)
+                frame_bgr = fig_to_frame(fig)
+                
+                if video_writer is None:
+                    h, w, _ = frame_bgr.shape
+                    os.makedirs(os.path.dirname(out_name) or '.', exist_ok=True)
+                    video_writer = cv2.VideoWriter(out_name, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    
+                video_writer.write(frame_bgr)
+                plt.close(fig) 
+                
+                print(f"Processed frame {i - start_idx + 1}/{num_frames}")
 
-if video_writer:
-    video_writer.release()
-print("✓ Video saved as evaluation_video5.mp4")
+        if video_writer:
+            video_writer.release()
+        print(f"✓ Video saved as {out_name}")
 
-final_scores = stq_metric.result()
-print("\nFinal Evaluation Scores:")
-print(f"STQ: {final_scores['STQ']:.4f}")
-print(f"AQ:  {final_scores['AQ']:.4f}")
-print(f"SQ:  {final_scores['IoU']:.4f}")
+        if has_gt:
+            final_scores = stq_metric.result()
+            print("\nFinal Evaluation Scores:")
+            print(f"STQ: {final_scores['STQ']:.4f}")
+            print(f"AQ:  {final_scores['AQ']:.4f}")
+            print(f"SQ:  {final_scores['IoU']:.4f}")
+        else:
+            print(f"\nEvaluation: Ran on '{split}' split (No Ground Truth). Skipping STQ scores.")
+
+if __name__ == '__main__':
+    evaluator = MotionDeepLabEvaluator(
+        weights_path='weights/motion_deeplab_epoch_90.pth', 
+        kitti_root='.'
+    )
+    
+    # Run Validation sequence
+    evaluator.evaluate_sequence(
+        target_seq="0029", 
+        split="test", 
+        num_frames=200, 
+        out_name="outputs/teak_epoch90.mp4"
+    )
+    
+    # Example: Run Test sequence
+    # evaluator.evaluate_sequence(
+    #     target_seq="0005", 
+    #     split="test", 
+    #     num_frames=100, 
+    #     out_name="outputs/test_video.mp4"
+    # )

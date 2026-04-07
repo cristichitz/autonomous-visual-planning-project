@@ -6,6 +6,147 @@ import torchvision
 import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision import transforms
+import random
+
+
+class JointPreprocessor:
+    def __init__(self, crop_size=(384, 1248), is_training=True, ignore_label=255):
+        self.crop_size = crop_size
+        self.is_training = is_training
+        self.ignore_label = ignore_label
+        self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.color_jitter = transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+
+    def __call__(self, curr_img, prev_img, curr_mask, prev_mask):
+        if self.is_training:
+            # 1. Random Scale (Discrete steps from 0.5 to 2.0, step 0.1)
+            scale_factor = random.choice([x / 10.0 for x in range(5, 21)])
+            new_h, new_w = int(curr_img.height * scale_factor), int(curr_img.width * scale_factor)
+            
+            curr_img = TF.resize(curr_img, (new_h, new_w))
+            prev_img = TF.resize(prev_img, (new_h, new_w))
+            curr_mask = TF.resize(curr_mask, (new_h, new_w), TF.InterpolationMode.NEAREST)
+            prev_mask = TF.resize(prev_mask, (new_h, new_w), TF.InterpolationMode.NEAREST)
+
+            # 2. Pad if smaller than crop size (Using ignore_label for masks!)
+            pad_h, pad_w = max(self.crop_size[0] - new_h, 0), max(self.crop_size[1] - new_w, 0)
+            if pad_h > 0 or pad_w > 0:
+                curr_img = TF.pad(curr_img, (0, 0, pad_w, pad_h))
+                prev_img = TF.pad(prev_img, (0, 0, pad_w, pad_h))
+                curr_mask = TF.pad(curr_mask, (0, 0, pad_w, pad_h), fill=self.ignore_label)
+                prev_mask = TF.pad(prev_mask, (0, 0, pad_w, pad_h), fill=self.ignore_label)
+
+            # 3. Random Crop
+            i, j, h, w = transforms.RandomCrop.get_params(curr_img, output_size=self.crop_size)
+            curr_img = TF.crop(curr_img, i, j, h, w)
+            prev_img = TF.crop(prev_img, i, j, h, w)
+            curr_mask = TF.crop(curr_mask, i, j, h, w)
+            prev_mask = TF.crop(prev_mask, i, j, h, w)
+
+            # 4. Random Horizontal Flip
+            if random.random() > 0.5:
+                curr_img, prev_img = TF.hflip(curr_img), TF.hflip(prev_img)
+                curr_mask, prev_mask = TF.hflip(curr_mask), TF.hflip(prev_mask)
+
+            # 5. Photometric Transform (Images ONLY)
+            curr_img, prev_img = self.color_jitter(curr_img), self.color_jitter(prev_img)
+            
+        else:
+            # Validation: Static Resize
+            curr_img = TF.resize(curr_img, self.crop_size)
+            prev_img = TF.resize(prev_img, self.crop_size)
+            curr_mask = TF.resize(curr_mask, self.crop_size, TF.InterpolationMode.NEAREST)
+            prev_mask = TF.resize(prev_mask, self.crop_size, TF.InterpolationMode.NEAREST)
+
+        # Convert to Normalized Tensors
+        curr_tensor = self.normalize(TF.to_tensor(curr_img))
+        prev_tensor = self.normalize(TF.to_tensor(prev_img))
+        stacked_images = torch.cat([curr_tensor, prev_tensor], dim=0)
+
+        return stacked_images, curr_mask, prev_mask
+
+class TargetGenerator:
+    def __init__(self, thing_ids=(11, 13), ignore_label=255, sigma=8.0):
+        self.thing_ids = thing_ids
+        self.ignore_label = ignore_label
+        self.sigma = sigma
+
+    def extract_semantics_and_instances(self, mask_pil):
+        """Converts RGB panoptic map into semantic and instance tensors, handling crowds."""
+        mask_np = np.array(mask_pil, dtype=np.int32)
+        semantic_map = mask_np[:, :, 0]
+        instance_map = mask_np[:, :, 1] * 256 + mask_np[:, :, 2]
+
+        is_thing = np.isin(semantic_map, self.thing_ids)
+        is_crowd = is_thing & (instance_map == 0)
+        instance_map[is_crowd] = self.ignore_label
+        
+        return torch.from_numpy(semantic_map).long(), torch.from_numpy(instance_map).long()
+    
+    def generate_targets(self, curr_mask_pil, prev_mask_pil):
+        """Generates all required targets for a SINGLE image pair (No batch dimension)."""
+        curr_sem, curr_inst = self.extract_semantics_and_instances(curr_mask_pil)
+        _, prev_inst = self.extract_semantics_and_instances(prev_mask_pil)
+
+        H, W = curr_inst.shape
+        
+        center_heatmaps = torch.zeros((1, H, W), dtype=torch.float32)
+        prev_heatmaps = torch.zeros((1, H, W), dtype=torch.float32)
+        center_offsets = torch.zeros((2, H, W), dtype=torch.float32)
+        motion_offsets = torch.zeros((2, H, W), dtype=torch.float32)
+        offset_weights = torch.zeros((1, H, W), dtype=torch.float32)
+
+        y_coord, x_coord = torch.meshgrid(
+            torch.arange(H, dtype=torch.float32),
+            torch.arange(W, dtype=torch.float32),
+            indexing='ij'
+        )
+
+        unique_ids = torch.unique(curr_inst)
+
+        for uid in unique_ids:
+            if uid == 0 or uid == self.ignore_label:
+                continue
+            
+            # Current frame mask
+            mask = (curr_inst == uid)
+            y_pixels, x_pixels = y_coord[mask], x_coord[mask]
+            center_y, center_x = y_pixels.mean(), x_pixels.mean()
+
+            # 1. Current Heatmap
+            dist_sq = (y_coord - center_y)**2 + (x_coord - center_x)**2
+            gaussian = torch.exp(-dist_sq / (2 * self.sigma**2))
+            center_heatmaps[0] = torch.maximum(center_heatmaps[0], gaussian)
+            
+            # 2. Spatial Offsets (Current pixel -> Current center)
+            center_offsets[0, mask] = center_y - y_pixels  # Y offset
+            center_offsets[1, mask] = center_x - x_pixels  # X offset
+            offset_weights[0, mask] = 1.0
+
+            # 3. Motion Offsets & Previous Heatmap (THE FIX)
+            prev_mask = (prev_inst == uid)
+            if prev_mask.any():
+                prev_y_pixels, prev_x_pixels = y_coord[prev_mask], x_coord[prev_mask]
+                prev_center_y, prev_center_x = prev_y_pixels.mean(), prev_x_pixels.mean()
+                
+                # Draw the previous heatmap
+                prev_dist_sq = (y_coord - prev_center_y)**2 + (x_coord - prev_center_x)**2
+                prev_gaussian = torch.exp(-prev_dist_sq / (2 * self.sigma**2))
+                prev_heatmaps[0] = torch.maximum(prev_heatmaps[0], prev_gaussian)
+                
+                # Calculate motion vectors
+                motion_offsets[0, mask] = prev_center_y - y_pixels
+                motion_offsets[1, mask] = prev_center_x - x_pixels
+
+        return {
+            'semantic': curr_sem,
+            'center_heatmaps': center_heatmaps,
+            'prev_heatmaps': prev_heatmaps,
+            'center_offsets': center_offsets,
+            'motion_offsets': motion_offsets,
+            'offset_weights': offset_weights
+        }
 
 class KittiStepDataset(Dataset):
     def __init__(self, root_dir, split='train', image_size=(384, 1248)):
@@ -22,9 +163,13 @@ class KittiStepDataset(Dataset):
         self.img_dir = os.path.join(root_dir, 'images', split)
         self.panoptic_dir = os.path.join(root_dir, 'panoptic_maps', split)
 
+        # Initialize the external engines
+        self.preprocessor = JointPreprocessor(crop_size=image_size, is_training=(split == 'train'))
+        self.target_generator = TargetGenerator(thing_ids=(11, 13), ignore_label=255)
+
+
         self.normalize = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         self.samples = []
-
         for sequence_id in sorted(os.listdir(self.img_dir)):
             seq_path = os.path.join(self.img_dir, sequence_id)
             if not os.path.isdir(seq_path): continue
@@ -35,7 +180,7 @@ class KittiStepDataset(Dataset):
                     'sequence_id': sequence_id,
                     'frame_name': frame_name
                 })
-        print("Samples test: ", self.samples[0])
+        print(f"Loaded {len(self.samples)} {split} samples. Example: ", self.samples[0])
 
     def __len__(self):
         return len(self.samples)
@@ -48,45 +193,53 @@ class KittiStepDataset(Dataset):
         frame_idx = int(frame_name.replace('.png', ''))
         # Ex: images/train/0000/000000.png
         curr_img_path = os.path.join(self.img_dir, seq_id, frame_name)
-        curr_panoptic_path = os.path.join(self.panoptic_dir, seq_id, frame_name)
 
         prev_frame_name = f"{(frame_idx - 1):06d}.png"
         prev_img_path = os.path.join(self.img_dir, seq_id, prev_frame_name)
-        prev_panoptic_path = os.path.join(self.panoptic_dir, seq_id, prev_frame_name)
         
         if not os.path.exists(prev_img_path):
             prev_img_path = curr_img_path
-            prev_panoptic_path = curr_panoptic_path
-
+        
         curr_img = Image.open(curr_img_path).convert('RGB')
         prev_img = Image.open(prev_img_path).convert('RGB')
-        
-        fixed_size = self.image_size
 
-        # Resize inputs
-        curr_img = TF.resize(curr_img, fixed_size)
-        prev_img = TF.resize(prev_img, fixed_size)
+
+        if self.split == 'test':
+            # Test mode: No masks exist. Just resize, normalize, and return.
+            curr_img = TF.resize(curr_img, self.image_size)
+            prev_img = TF.resize(prev_img, self.image_size)
+            curr_tensor = self.normalize(TF.to_tensor(curr_img))
+            prev_tensor = self.normalize(TF.to_tensor(prev_img))
+            stacked_images = torch.cat([curr_tensor, prev_tensor], dim=0)
+            
+            return stacked_images
+        
+        curr_panoptic_path = os.path.join(self.panoptic_dir, seq_id, frame_name)
+        prev_panoptic_path = os.path.join(self.panoptic_dir, seq_id, prev_frame_name)
+
+        if not os.path.exists(prev_panoptic_path):
+            prev_panoptic_path = curr_panoptic_path
 
         curr_panoptic_map = Image.open(curr_panoptic_path)
-        curr_panoptic_map = TF.resize(curr_panoptic_map, fixed_size, interpolation=TF.InterpolationMode.NEAREST)
-
         prev_panoptic_map = Image.open(prev_panoptic_path)
-        prev_panoptic_map = TF.resize(prev_panoptic_map, fixed_size, interpolation=TF.InterpolationMode.NEAREST)
+
+        stacked_images, curr_mask_aug, prev_mask_aug = self.preprocessor(
+            curr_img, prev_img, curr_panoptic_map, prev_panoptic_map
+        )
+
+        # EVALUATION FAST-PATH: STQ only needs semantic and instance IDs. Skip heatmaps.
+        if self.split == 'val':
+            curr_sem, curr_inst = self.target_generator.extract_semantics_and_instances(curr_mask_aug)
+            return stacked_images, curr_sem, curr_inst, None
         
-        curr_tensor = self.normalize(TF.to_tensor(curr_img))
-        prev_tensor = self.normalize(TF.to_tensor(prev_img))
-        stacked_images = torch.cat([curr_tensor, prev_tensor], dim=0)
+        targets = self.target_generator.generate_targets(curr_mask_aug, prev_mask_aug)
 
-        panoptic_np = np.array(curr_panoptic_map, dtype=np.int32)
-        semantic_map = panoptic_np[:, :, 0]
-        instance_map = panoptic_np[:, :, 1] * 256 + panoptic_np[:, :, 2]
-
-        # Process previous panoptic map
-        prev_panoptic_np = np.array(prev_panoptic_map, dtype=np.int32)
-        prev_instance_map = prev_panoptic_np[:, :, 1] * 256 + prev_panoptic_np[:, :, 2]
-        
-        semantic_tensor = torch.from_numpy(semantic_map).long()
-        instance_tensor = torch.from_numpy(instance_map).long()
-        prev_instance_tensor = torch.from_numpy(prev_instance_map).long()
-
-        return stacked_images, semantic_tensor, instance_tensor, prev_instance_tensor
+        return (
+            stacked_images, 
+            targets['semantic'], 
+            targets['center_heatmaps'], 
+            targets['prev_heatmaps'],
+            targets['center_offsets'], 
+            targets['motion_offsets'], 
+            targets['offset_weights']
+        )   
