@@ -213,10 +213,10 @@ if __name__ == '__main__':
     
     # Run Validation sequence
     evaluator.evaluate_sequence(
-        target_seq="0029", 
-        split="test", 
-        num_frames=200, 
-        out_name="outputs/teak_epoch90.mp4"
+        target_seq="0013", 
+        split="val", 
+        num_frames=100, 
+        out_name="outputs/0013_epoch90.mp4"
     )
     
     # Example: Run Test sequence
