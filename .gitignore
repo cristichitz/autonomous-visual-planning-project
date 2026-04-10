@@ -6,6 +6,7 @@ motion-deeplab.py
 weights/*
 !weights/motion_deeplab_epoch_90.pth
 !weights/COCO_motion_deeplab_epoch_50.pth
+!weights/motion_deeplab_epoch_180.pth
 
 outputs/*
 !outputs/evaluation_video_0006.mp4

@@ -207,24 +207,24 @@ class MotionDeepLabEvaluator:
 
 if __name__ == '__main__':
     evaluator1 = MotionDeepLabEvaluator(
-        weights_path='weights/motion_deeplab_epoch_90.pth', 
+        weights_path='weights/motion_deeplab_epoch_180.pth', 
         kitti_root='.'
     )
         
     evaluator2 = MotionDeepLabEvaluator(
-        weights_path='weights/COCO_motion_deeplab_epoch_50.pth', 
+        weights_path='weights/motion_deeplab_cityscapes_epoch_50.pth', 
         kitti_root='.'
     )
     
     # Run Validation sequence
-    print("Evaluating seq 13 from Eval dataset with imageNet")
+    print("Evaluating seq 13 from Eval dataset with 180")
     evaluator1.evaluate_sequence(
         target_seq="0013", 
         split="val", 
         num_frames=100, 
         out_name="outputs/val0013_epoch90.mp4"
     )
-    print("Evaluating seq 13 from Eval dataset with COCO")
+    print("Evaluating seq 13 from Eval dataset with cityscapes")
     evaluator2.evaluate_sequence(
         target_seq="0013", 
         split="val", 
@@ -232,7 +232,7 @@ if __name__ == '__main__':
         out_name="outputs/val0013_coco_epoch50.mp4"
     )
     
-    print("Evaluating overfit on seq1 from Train dataset with ImageNet backbone")
+    print("Evaluating overfit on seq1 from Train dataset with 180")
     evaluator1.evaluate_sequence(
         target_seq="0001", 
         split="val", 
@@ -240,7 +240,7 @@ if __name__ == '__main__':
         out_name="outputs/train0001_epoch90.mp4"
     )
 
-    print("Evaluating overfit on seq1 from Train with COCO backbone")
+    print("Evaluating overfit on seq1 from Train with cityscapes 50")
     evaluator2.evaluate_sequence(
         target_seq="0001",
         split="val",
