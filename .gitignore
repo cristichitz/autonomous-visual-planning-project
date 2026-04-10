@@ -4,8 +4,6 @@ dl_env/
 motion-deeplab.py
 
 weights/*
-!weights/motion_deeplab_epoch_11.pth
-!weights/motion_deeplab_epoch_49.pth
 !weights/motion_deeplab_epoch_90.pth
 !weights/COCO_motion_deeplab_epoch_50.pth
 
