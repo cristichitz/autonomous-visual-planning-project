@@ -4,19 +4,23 @@ import torch.nn.functional as F
 import torchvision.models as models
 
 from   torchvision.models import resnet50, ResNet50_Weights
+from   torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
 from   post_processor import PanopticPostProcessor, MotionTracker
 
-
 class MotionDeepLabResNet50(nn.Module):
-    """Pretrained ResNet50 backbone modified for Motion-DeepLab."""
     def __init__(self):
         super().__init__()
 
-        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        resnet = resnet50(weights=None)
+        print("Loading COCO segmentation weights from Torchvision...")
+
+        deeplab_coco = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
+        backbone_weights = deeplab_coco.backbone.state_dict()
+        resnet.load_state_dict(backbone_weights, strict=False)
 
         original_conv1 = resnet.conv1
         self.conv1 = nn.Conv2d(
-            in_channels=7, # 3 for Frame 1, 3 for Frame 2, 1 for Prev Heatmap
+            in_channels=7, 
             out_channels=original_conv1.out_channels,
             kernel_size=original_conv1.kernel_size,
             stride=original_conv1.stride,
@@ -26,42 +30,33 @@ class MotionDeepLabResNet50(nn.Module):
 
         with torch.no_grad():
             new_weights = torch.zeros(
-                original_conv1.out_channels,
-                7,
-                original_conv1.kernel_size[0],
+                original_conv1.out_channels, 7, 
+                original_conv1.kernel_size[0], 
                 original_conv1.kernel_size[1]
             )
+            # Use the newly loaded COCO weights for the RGB channels
             new_weights[:, :3, :, :] = original_conv1.weight / 2.0
             new_weights[:, 3:6, :, :] = original_conv1.weight / 2.0
             self.conv1.weight.copy_(new_weights)
-        
+
         self.bn1 = resnet.bn1
         self.relu = resnet.relu
         self.maxpool = resnet.maxpool
 
-        self.layer1 = resnet.layer1 # 'res2' in DeepLab
-        self.layer2 = resnet.layer2 # 'res3'
-        self.layer3 = resnet.layer3 # 'res4'
-        self.layer4 = resnet.layer4 # 'res5'
-    
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        
     def forward(self, x):
-        # x expected shape: (Batch, 6, Height, Width)
-
-        # Stem
         x = self.conv1(x)
         x = self.maxpool(self.relu(self.bn1(x)))
-
         res2 = self.layer1(x)
         res3 = self.layer2(res2)
         res4 = self.layer3(res3)
         res5 = self.layer4(res4)
 
-        return {
-            'res2': res2,
-            'res3': res3,
-            'res5': res5
-        }
-
+        return {'res2': res2, 'res3': res3, 'res5': res5}
 
 class ConvBNReLU(nn.Module):
     """A standard block grouping Conv2d, BatchNorm2d, and ReLU"""

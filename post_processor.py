@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PanopticPostProcessor(nn.Module):
-    def __init__(self, thing_class_ids, center_threshold=0.1, nms_kernel=9,
-                 keep_k_centers=200, label_divisor=256, stuff_area_limit=4096, void_label=255):
+    def __init__(self, thing_class_ids, center_threshold=0.1, nms_kernel=13,
+                 keep_k_centers=200, label_divisor=1000, stuff_area_limit=4096, void_label=255):
         super().__init__()
 
         self.register_buffer('thing_class_ids', torch.tensor(thing_class_ids, dtype=torch.long))
@@ -230,12 +230,11 @@ class MotionTracker:
             
         updated_current_centers = torch.stack(updated_current_centers)
         
-        # Keep unmatched previous centers for 'sigma' frames in case they reappear
         unmatched_prev = self.prev_centers[~prev_matched].clone()
         final_centers = torch.cat([updated_current_centers, unmatched_prev], dim=0) if len(unmatched_prev) > 0 else updated_current_centers
             
         if len(final_centers) > 0:
-            final_centers[:, 4] += 1 # Age up all centers
+            final_centers[:, 4] += 1
             final_centers = final_centers[final_centers[:, 4] <= self.sigma_track] # Kill old ones
             
         self.prev_centers = final_centers

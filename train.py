@@ -6,140 +6,78 @@ from    loss  import compute_loss, generate_panoptic_targets
 from    dataset import KittiStepDataset
 from    torch.utils.data import DataLoader
 
-# KITTI_THING_IDS = [11, 13]
-# KITTI_STEP_ROOT = '.'
-# train_ds = KittiStepDataset(root_dir=KITTI_STEP_ROOT, split='train')
-
-# BATCH_SIZE = 4
-# train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-
-# for stacked_images, semantic_masks, instance_masks, prev_inst_masks in train_loader:
-#     print("Batch loaded succesfully!")
-#     print(f"Images shape:    {stacked_images.shape}")  
-#     print(f"Semantics shape: {semantic_masks.shape}")  
-#     print(f"Instances shape: {instance_masks.shape}") 
-#     print(f"Prev Instances shape: {prev_inst_masks.shape}")  
-
-#     break
-
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# model = MotionDeepLab(
-#     thing_class_ids=KITTI_THING_IDS,
-#     label_divisor=1000,    # Updated based on your config!
-#     void_label=255         # Confirmed by ignore_label=255 in your config
-# ).to(device)
-
-# backbone_params, head_params = [], []
-# for name, param in model.named_parameters():
-#     if 'encoder' in name: 
-#         backbone_params.append(param)
-#     else:
-#         head_params.append(param)
-
-# optimizer = torch.optim.AdamW([
-#     {'params': backbone_params, 'lr': 1e-5},
-#     {'params': head_params, 'lr': 1e-4} 
-# ], weight_decay=1e-4)
-# # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-
-# scaler = GradScaler()
-# EPOCHS = 25
-# ACCUMULATION_STEPS = 4
-# CURRENT_MODEL = 'weights/motion_deeplab_epoch_10.pth'
-# RESUME_TRAINING = True
-
-# total_steps = EPOCHS * len(train_loader)
-# poly_power = 0.9
-
-# def poly_decay(current_step):
-#     if current_step >= total_steps:
-#         return 0.0
-#     return (1.0 - current_step / total_steps) ** poly_power
-
-# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_decay) 
-
-# start_epoch = 1
-# if RESUME_TRAINING and os.path.exists(CURRENT_MODEL):
-#     checkpoint = torch.load(CURRENT_MODEL)
-    
-#     # Check if this is the new dictionary format or the old raw weights
-#     if 'model_state' in checkpoint:
-#         model.load_state_dict(checkpoint['model_state'])
-#         optimizer.load_state_dict(checkpoint['optimizer_state'])
-#         scheduler.load_state_dict(checkpoint['scheduler_state']) # Fixed typo here
-#         start_epoch = checkpoint['epoch'] + 1
-#         print(f"Resuming full state from Epoch {start_epoch}")
-#     else:
-#         # Fallback for your Epoch 10 raw weights
-#         model.load_state_dict(checkpoint, strict=False)
-#         start_epoch = 11  # You know the old model was epoch 10
-#         print(f"Loaded raw weights from {CURRENT_MODEL}. Optimizer starting cold at Epoch 11.")
-
-# print("Starting training!")
-# for epoch in range(start_epoch, EPOCHS + 1):
-#     model.train()
-#     optimizer.zero_grad()
-#     running_loss = 0
-#     for i, (images, sem_masks, inst_masks, prev_inst_masks) in enumerate(train_loader):
-#         images = images.to(device)
-#         sem_masks = sem_masks.to(device)
-#         inst_masks = inst_masks.to(device)
-#         prev_inst_masks = prev_inst_masks.to(device)
-
-#         gt_heatmaps, gt_inst_offsets, offset_weights = generate_panoptic_targets(inst_masks)
+class GPUMathTargetGenerator:
+    """Performs all heatmap and offset math on the GPU for a full batch."""
+    def __init__(self, device, image_size=(384, 1248), ignore_label=255, sigma=8.0):
+        self.device = device
+        self.ignore_label = ignore_label
+        self.sigma = sigma
         
-#         # We need the motion targets as well (distance from current pixel to Previous frame)
-#         prev_heatmaps, gt_motion_offsets, _ = generate_panoptic_targets(prev_inst_masks)
+        H, W = image_size
+        y_coord, x_coord = torch.meshgrid(
+            torch.arange(H, dtype=torch.float32, device=device),
+            torch.arange(W, dtype=torch.float32, device=device),
+            indexing='ij'
+        )
+        self.y_coord = y_coord.unsqueeze(0) # Shape: (1, H, W)
+        self.x_coord = x_coord.unsqueeze(0)
 
-#         targets = {
-#             'semantic_masks': sem_masks,
-#             'center_heatmaps': gt_heatmaps,
-#             'center_offsets': gt_inst_offsets,
-#             'motion_offsets': gt_motion_offsets
-#         }
-#         # model_input = torch.cat([images, prev_heatmaps], dim=1)
+    def generate(self, curr_inst, prev_inst):
+        B, H, W = curr_inst.shape
+        
+        center_heatmaps = torch.zeros((B, 1, H, W), dtype=torch.float32, device=self.device)
+        prev_heatmaps = torch.zeros((B, 1, H, W), dtype=torch.float32, device=self.device)
+        center_offsets = torch.zeros((B, 2, H, W), dtype=torch.float32, device=self.device)
+        motion_offsets = torch.zeros((B, 2, H, W), dtype=torch.float32, device=self.device)
+        offset_weights = torch.zeros((B, 1, H, W), dtype=torch.float32, device=self.device)
 
-#         with autocast(device_type='cuda'):
-#             predictions = model(images, gt_prev_heatmap=prev_heatmaps)
-#             total_loss, _, _, _, _ = compute_loss(predictions, targets, offset_weights)
-#             loss_value = total_loss.item()
-#             total_loss = total_loss / ACCUMULATION_STEPS
+        # Process each item in the batch
+        for b in range(B):
+            c_inst = curr_inst[b]
+            p_inst = prev_inst[b]
+            
+            unique_ids = torch.unique(c_inst)
 
-#         scaler.scale(total_loss).backward()
-#         running_loss += loss_value
-#         if (i + 1) % ACCUMULATION_STEPS == 0:
-#             scaler.unscale_(optimizer)
-#             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-#             current_scale = scaler.get_scale()
-#             scaler.step(optimizer)
-#             scaler.update()
-#             # 2. Only step the scheduler if the scale didn't drop 
-#             # (A dropped scale means gradients were bad and optimizer was skipped)
-#             if current_scale <= scaler.get_scale():
-#                 scheduler.step()
-#             optimizer.zero_grad()
-#         if (i + 1) % 50 == 0:
-#             avg_loss = running_loss / 50
-#             print(f"Epoch [{epoch}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Loss: {avg_loss:.4f}")
-#             running_loss = 0.0
+            for uid in unique_ids:
+                if uid == 0 or uid == self.ignore_label:
+                    continue
+                
+                mask = (c_inst == uid)
+                y_pixels = self.y_coord[0][mask]
+                x_pixels = self.x_coord[0][mask]
+                
+                center_y, center_x = y_pixels.mean(), x_pixels.mean()
 
-#     print(f"Epoch {epoch} Complete.")
-#     checkpoint = {
-#     'epoch': epoch,
-#     'model_state': model.state_dict(),
-#     'optimizer_state': optimizer.state_dict(),
-#     'scheduler_state': scheduler.state_dict()
-#     }
-#     torch.save(checkpoint, f'motion_deeplab_epoch_{epoch}.pth')
-#     print(f"Model saved to motion_deeplab_epoch_{epoch}.pth")
+                dist_sq = (self.y_coord[0] - center_y)**2 + (self.x_coord[0] - center_x)**2
+                gaussian = torch.exp(-dist_sq / (2 * self.sigma**2))
+                center_heatmaps[b, 0] = torch.maximum(center_heatmaps[b, 0], gaussian)
+                
+                center_offsets[b, 0, mask] = center_y - y_pixels
+                center_offsets[b, 1, mask] = center_x - x_pixels
+                offset_weights[b, 0, mask] = 1.0
 
+                prev_mask = (p_inst == uid)
+                if prev_mask.any():
+                    prev_y_pixels = self.y_coord[0][prev_mask]
+                    prev_x_pixels = self.x_coord[0][prev_mask]
+                    prev_center_y, prev_center_x = prev_y_pixels.mean(), prev_x_pixels.mean()
+                    
+                    prev_dist_sq = (self.y_coord[0] - prev_center_y)**2 + (self.x_coord[0] - prev_center_x)**2
+                    prev_gaussian = torch.exp(-prev_dist_sq / (2 * self.sigma**2))
+                    prev_heatmaps[b, 0] = torch.maximum(prev_heatmaps[b, 0], prev_gaussian)
+                    
+                    motion_offsets[b, 0, mask] = prev_center_y - y_pixels
+                    motion_offsets[b, 1, mask] = prev_center_x - x_pixels
+
+        return center_heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights
 
 class  Trainer:
-    def __init__(self, root_dir, batch_size=4, epochs=25, accumulation_steps=4, current_model_path=None):
+    def __init__(self, root_dir, batch_size=4, epochs=25, accumulation_steps=4, current_model_path=None, save_freq=5):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.epochs = epochs
         self.accumulation_steps = accumulation_steps
         self.current_model_path = current_model_path
+        self.save_freq = save_freq
         self.train_ds = KittiStepDataset(root_dir=root_dir, split='train')
         self.train_loader = DataLoader(
             self.train_ds, 
@@ -201,14 +139,18 @@ class  Trainer:
         self.optimizer.zero_grad()
         running_loss = 0.0
 
-        # Unpacking the NEW dataset returns directly
+        if not hasattr(self, 'gpu_target_gen'):
+            self.gpu_target_gen = GPUMathTargetGenerator(self.device)
+
         for i, batch in enumerate(self.train_loader):
-            images, sem_masks, heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights = [
-                b.to(self.device) for b in batch
-            ]
+            images, curr_sem, curr_inst, prev_inst = [b.to(self.device) for b in batch]
+
+            with torch.no_grad():
+                heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights = \
+                    self.gpu_target_gen.generate(curr_inst, prev_inst)
 
             targets = {
-                'semantic_masks': sem_masks,
+                'semantic_masks': curr_sem,
                 'center_heatmaps': heatmaps,
                 'center_offsets': center_offsets,
                 'motion_offsets': motion_offsets
@@ -252,21 +194,21 @@ class  Trainer:
         for epoch in range(self.start_epoch, self.epochs + 1):
             self._train_epoch(epoch)
             
-            # Save Checkpoint
-            checkpoint = {
-                'epoch': epoch,
-                'model_state': self.model.state_dict(),
-                'optimizer_state': self.optimizer.state_dict(),
-                'scheduler_state': self.scheduler.state_dict()
-            }
-            save_path = f'weights/motion_deeplab_epoch_{epoch}.pth'
-            os.makedirs('weights', exist_ok=True)
-            torch.save(checkpoint, save_path)
-            print(f"Epoch {epoch} Complete. Saved to {save_path}")
+            if epoch % self.save_freq == 0 or epoch == self.epochs:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state': self.model.state_dict(),
+                    'optimizer_state': self.optimizer.state_dict(),
+                    'scheduler_state': self.scheduler.state_dict()
+                }
+                save_path = f'weights/motion_deeplab_epoch_{epoch}.pth'
+                os.makedirs('weights', exist_ok=True)
+                torch.save(checkpoint, save_path)
+                print(f"Saved to {save_path}")
+            print(f"Epoch {epoch} Complete.")
 
 
 if __name__ == '__main__':
-    # Clean, centralized execution
     trainer = Trainer(
         root_dir='.',
         batch_size=4,

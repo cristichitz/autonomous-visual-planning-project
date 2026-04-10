@@ -206,23 +206,44 @@ class MotionDeepLabEvaluator:
             print(f"\nEvaluation: Ran on '{split}' split (No Ground Truth). Skipping STQ scores.")
 
 if __name__ == '__main__':
-    evaluator = MotionDeepLabEvaluator(
+    evaluator1 = MotionDeepLabEvaluator(
         weights_path='weights/motion_deeplab_epoch_90.pth', 
+        kitti_root='.'
+    )
+        
+    evaluator2 = MotionDeepLabEvaluator(
+        weights_path='weights/COCO_motion_deeplab_epoch_50.pth', 
         kitti_root='.'
     )
     
     # Run Validation sequence
-    evaluator.evaluate_sequence(
+    print("Evaluating seq 13 from Eval dataset with imageNet")
+    evaluator1.evaluate_sequence(
         target_seq="0013", 
         split="val", 
         num_frames=100, 
-        out_name="outputs/0013_epoch90.mp4"
+        out_name="outputs/val0013_epoch90.mp4"
+    )
+    print("Evaluating seq 13 from Eval dataset with COCO")
+    evaluator2.evaluate_sequence(
+        target_seq="0013", 
+        split="val", 
+        num_frames=100, 
+        out_name="outputs/val0013_coco_epoch50.mp4"
     )
     
-    # Example: Run Test sequence
-    # evaluator.evaluate_sequence(
-    #     target_seq="0005", 
-    #     split="test", 
-    #     num_frames=100, 
-    #     out_name="outputs/test_video.mp4"
-    # )
+    print("Evaluating overfit on seq1 from Train dataset with ImageNet backbone")
+    evaluator1.evaluate_sequence(
+        target_seq="0001", 
+        split="val", 
+        num_frames=100, 
+        out_name="outputs/train0001_epoch90.mp4"
+    )
+
+    print("Evaluating overfit on seq1 from Train with COCO backbone")
+    evaluator2.evaluate_sequence(
+        target_seq="0001",
+        split="val",
+        num_frames=100,
+        out_name="outputs/train0001_coco_epoch50.mp4"
+    )

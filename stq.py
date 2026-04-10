@@ -63,7 +63,6 @@ class STQuality(object):
         if id_array.numel() == 0:
             return
         unique_ids, counts = torch.unique(id_array, return_counts=True)
-        # Move to CPU purely for dictionary storage so we don't blow up VRAM
         unique_ids = unique_ids.cpu().numpy()
         counts = counts.cpu().numpy()
         
@@ -128,20 +127,13 @@ class STQuality(object):
             label_mask |= (semantic_label == things_class_id)
             prediction_mask |= (semantic_prediction == things_class_id)
 
-        # Select 'crowd' region of the current class. This region is encoded instance id '0'
         is_crowd = (instance_label == 0) & label_mask
-        # Select the non-crowd region of the corresponding class as the 'crowd' region
-        # is ignored for the tracking trem
         label_mask = (label_mask & (~is_crowd))
-        # Do not punish id assignment for regions that are annotated as `crowd` in
-        # the ground-truth.
         prediction_mask = (prediction_mask & (~is_crowd))
 
         seq_preds = self._predictions[sequence_id]
         seq_gts = self._ground_truth[sequence_id]
         seq_intersects = self._intersections[sequence_id]
-
-        # Compute and update areas of ground-trutth, predictions and intersections
 
         self._update_dict_stats(seq_preds, y_pred[prediction_mask])
         self._update_dict_stats(seq_gts, y_true[label_mask])
@@ -198,7 +190,6 @@ class STQuality(object):
 
         # Compute IoU scores.
         # The rows correspond to ground-truth and the columns to predictions.
-        # Remove fp from confusion matrix for the void/ignore class.
         total_confusion = np.zeros(
             (self._confusion_matrix_size, self._confusion_matrix_size),
             dtype=np.float64)

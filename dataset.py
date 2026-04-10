@@ -53,7 +53,6 @@ class JointPreprocessor:
             curr_img, prev_img = self.color_jitter(curr_img), self.color_jitter(prev_img)
             
         else:
-            # Validation: Static Resize
             curr_img = TF.resize(curr_img, self.crop_size)
             prev_img = TF.resize(prev_img, self.crop_size)
             curr_mask = TF.resize(curr_mask, self.crop_size, TF.InterpolationMode.NEAREST)
@@ -72,81 +71,19 @@ class TargetGenerator:
         self.ignore_label = ignore_label
         self.sigma = sigma
 
-    def extract_semantics_and_instances(self, mask_pil):
-        """Converts RGB panoptic map into semantic and instance tensors, handling crowds."""
+    def extract(self, mask_pil):
         mask_np = np.array(mask_pil, dtype=np.int32)
         semantic_map = mask_np[:, :, 0]
         instance_map = mask_np[:, :, 1] * 256 + mask_np[:, :, 2]
 
+        instance_map[semantic_map == self.ignore_label] = 0
         is_thing = np.isin(semantic_map, self.thing_ids)
+        instance_map[~is_thing] = 0
+
         is_crowd = is_thing & (instance_map == 0)
         instance_map[is_crowd] = self.ignore_label
         
         return torch.from_numpy(semantic_map).long(), torch.from_numpy(instance_map).long()
-    
-    def generate_targets(self, curr_mask_pil, prev_mask_pil):
-        """Generates all required targets for a SINGLE image pair (No batch dimension)."""
-        curr_sem, curr_inst = self.extract_semantics_and_instances(curr_mask_pil)
-        _, prev_inst = self.extract_semantics_and_instances(prev_mask_pil)
-
-        H, W = curr_inst.shape
-        
-        center_heatmaps = torch.zeros((1, H, W), dtype=torch.float32)
-        prev_heatmaps = torch.zeros((1, H, W), dtype=torch.float32)
-        center_offsets = torch.zeros((2, H, W), dtype=torch.float32)
-        motion_offsets = torch.zeros((2, H, W), dtype=torch.float32)
-        offset_weights = torch.zeros((1, H, W), dtype=torch.float32)
-
-        y_coord, x_coord = torch.meshgrid(
-            torch.arange(H, dtype=torch.float32),
-            torch.arange(W, dtype=torch.float32),
-            indexing='ij'
-        )
-
-        unique_ids = torch.unique(curr_inst)
-
-        for uid in unique_ids:
-            if uid == 0 or uid == self.ignore_label:
-                continue
-            
-            # Current frame mask
-            mask = (curr_inst == uid)
-            y_pixels, x_pixels = y_coord[mask], x_coord[mask]
-            center_y, center_x = y_pixels.mean(), x_pixels.mean()
-
-            # 1. Current Heatmap
-            dist_sq = (y_coord - center_y)**2 + (x_coord - center_x)**2
-            gaussian = torch.exp(-dist_sq / (2 * self.sigma**2))
-            center_heatmaps[0] = torch.maximum(center_heatmaps[0], gaussian)
-            
-            # 2. Spatial Offsets (Current pixel -> Current center)
-            center_offsets[0, mask] = center_y - y_pixels  # Y offset
-            center_offsets[1, mask] = center_x - x_pixels  # X offset
-            offset_weights[0, mask] = 1.0
-
-            # 3. Motion Offsets & Previous Heatmap (THE FIX)
-            prev_mask = (prev_inst == uid)
-            if prev_mask.any():
-                prev_y_pixels, prev_x_pixels = y_coord[prev_mask], x_coord[prev_mask]
-                prev_center_y, prev_center_x = prev_y_pixels.mean(), prev_x_pixels.mean()
-                
-                # Draw the previous heatmap
-                prev_dist_sq = (y_coord - prev_center_y)**2 + (x_coord - prev_center_x)**2
-                prev_gaussian = torch.exp(-prev_dist_sq / (2 * self.sigma**2))
-                prev_heatmaps[0] = torch.maximum(prev_heatmaps[0], prev_gaussian)
-                
-                # Calculate motion vectors
-                motion_offsets[0, mask] = prev_center_y - y_pixels
-                motion_offsets[1, mask] = prev_center_x - x_pixels
-
-        return {
-            'semantic': curr_sem,
-            'center_heatmaps': center_heatmaps,
-            'prev_heatmaps': prev_heatmaps,
-            'center_offsets': center_offsets,
-            'motion_offsets': motion_offsets,
-            'offset_weights': offset_weights
-        }
 
 class KittiStepDataset(Dataset):
     def __init__(self, root_dir, split='train', image_size=(384, 1248)):
@@ -165,10 +102,9 @@ class KittiStepDataset(Dataset):
 
         # Initialize the external engines
         self.preprocessor = JointPreprocessor(crop_size=image_size, is_training=(split == 'train'))
-        self.target_generator = TargetGenerator(thing_ids=(11, 13), ignore_label=255)
-
-
+        self.extractor = TargetGenerator(thing_ids=(11, 13), ignore_label=255)
         self.normalize = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        
         self.samples = []
         for sequence_id in sorted(os.listdir(self.img_dir)):
             seq_path = os.path.join(self.img_dir, sequence_id)
@@ -227,19 +163,7 @@ class KittiStepDataset(Dataset):
             curr_img, prev_img, curr_panoptic_map, prev_panoptic_map
         )
 
-        # EVALUATION FAST-PATH: STQ only needs semantic and instance IDs. Skip heatmaps.
-        if self.split == 'val':
-            curr_sem, curr_inst = self.target_generator.extract_semantics_and_instances(curr_mask_aug)
-            return stacked_images, curr_sem, curr_inst, None
-        
-        targets = self.target_generator.generate_targets(curr_mask_aug, prev_mask_aug)
+        curr_sem, curr_inst = self.extractor.extract(curr_mask_aug)
+        prev_sem, prev_inst = self.extractor.extract(prev_mask_aug)
 
-        return (
-            stacked_images, 
-            targets['semantic'], 
-            targets['center_heatmaps'], 
-            targets['prev_heatmaps'],
-            targets['center_offsets'], 
-            targets['motion_offsets'], 
-            targets['offset_weights']
-        )   
+        return stacked_images, curr_sem, curr_inst, prev_inst
