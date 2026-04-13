@@ -1,29 +1,54 @@
 import torch
 import torch.nn.functional as F
 
-def compute_loss(predictions, targets, offset_weights):
-    # Semantic loss (cross entropy)
-    sem_loss = F.cross_entropy(
+def compute_semantic_loss_topk(pred_logits, gt_labels, ignore_index=255, top_k_percent=0.2):
+    # Per-pixel CE without reduction
+    per_pixel_loss = F.cross_entropy(
+        pred_logits, gt_labels, ignore_index=ignore_index, reduction='none'
+    )  # [B, H, W]
+    
+    B = per_pixel_loss.shape[0]
+    per_pixel_loss = per_pixel_loss.view(B, -1)  # [B, H*W]
+    
+    num_pixels = per_pixel_loss.shape[1]
+    top_k = max(1, int(round(top_k_percent * num_pixels)))
+    
+    topk_loss, _ = torch.topk(per_pixel_loss, top_k, dim=1)
+    
+    # Mean over non-zero only
+    non_zero = (topk_loss > 0).float().sum(dim=1)
+    loss_sum = topk_loss.sum(dim=1)
+    per_sample = loss_sum / non_zero.clamp(min=1)
+    
+    return per_sample.mean()
+
+def compute_loss(predictions, targets, offset_weights, center_weights):
+    # Semantic loss (top-k cross entropy)
+    sem_loss = compute_semantic_loss_topk(
         predictions['semantic_logits'],
         targets['semantic_masks'],
-        ignore_index=255
+        ignore_index=255,
+        top_k_percent=0.2
     )
 
     # Instance center heatmap loss (mean squared error)
-    # Weight: 200.0
-    center_loss = F.mse_loss(
-        predictions['center_heatmap'],
-        targets['center_heatmaps']
-    )
+    center_diff_sq = (predictions['center_heatmap'] - targets['center_heatmaps']) ** 2
+    weighted_center_loss = center_diff_sq * center_weights
+    num_valid_center = center_weights.sum().clamp(min=1)
+    center_loss = weighted_center_loss.sum() / num_valid_center
 
     # Instance regression loss (L1)
     inst_reg_diff = torch.abs(predictions['center_offsets'] - targets['center_offsets'])
-    inst_reg_loss = torch.mean(inst_reg_diff * offset_weights)
+    inst_reg_diff = inst_reg_diff.mean(dim=1, keepdim=True)
+    weighted_inst_loss = inst_reg_diff * offset_weights
+    num_valid_offset = offset_weights.sum().clamp(min=1)
+    inst_reg_loss = weighted_inst_loss.sum() / num_valid_offset
 
     # Motion Regression Loss (L1)
-
     motion_reg_diff = torch.abs(predictions['motion_offsets'] - targets['motion_offsets'])
-    motion_reg_loss = torch.mean(motion_reg_diff * offset_weights)
+    motion_reg_diff = motion_reg_diff.mean(dim=1, keepdim=True)
+    weighted_motion_loss = motion_reg_diff * offset_weights
+    motion_reg_loss = weighted_motion_loss.sum() / num_valid_offset
 
     total_loss = sem_loss + (200.0 * center_loss) + (0.01 * inst_reg_loss) + (0.01 * motion_reg_loss)
     return total_loss, sem_loss, center_loss, inst_reg_loss, motion_reg_loss

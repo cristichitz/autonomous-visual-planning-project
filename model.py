@@ -331,3 +331,8 @@ class MotionDeepLab(nn.Module):
     
     def update_tracking_state(self, new_center_heatmap):
         self.prev_center = new_center_heatmap.detach().unsqueeze(1)
+
+    def reset_tracking_state(self):
+        self.prev_center_heatmap = None
+        device = next(self.parameters()).device
+        self.tracker.reset_state(device)

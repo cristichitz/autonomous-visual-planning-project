@@ -22,7 +22,7 @@ class GPUMathTargetGenerator:
         self.y_coord = y_coord.unsqueeze(0) # Shape: (1, H, W)
         self.x_coord = x_coord.unsqueeze(0)
 
-    def generate(self, curr_inst, prev_inst):
+    def generate(self, curr_sem, curr_inst, prev_inst):
         B, H, W = curr_inst.shape
         
         center_heatmaps = torch.zeros((B, 1, H, W), dtype=torch.float32, device=self.device)
@@ -30,11 +30,15 @@ class GPUMathTargetGenerator:
         center_offsets = torch.zeros((B, 2, H, W), dtype=torch.float32, device=self.device)
         motion_offsets = torch.zeros((B, 2, H, W), dtype=torch.float32, device=self.device)
         offset_weights = torch.zeros((B, 1, H, W), dtype=torch.float32, device=self.device)
+        center_weights = torch.ones((B, 1, H, W), dtype=torch.float32, device=self.device)
 
         # Process each item in the batch
         for b in range(B):
             c_inst = curr_inst[b]
             p_inst = prev_inst[b]
+            c_sem = curr_sem[b]
+            
+            center_weights[b, 0, c_sem == self.ignore_label] = 0.0
             
             unique_ids = torch.unique(c_inst)
 
@@ -69,7 +73,7 @@ class GPUMathTargetGenerator:
                     motion_offsets[b, 0, mask] = prev_center_y - y_pixels
                     motion_offsets[b, 1, mask] = prev_center_x - x_pixels
 
-        return center_heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights
+        return center_heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights, center_weights
 
 class  Trainer:
     def __init__(self, root_dir, batch_size=4, epochs=25, accumulation_steps=4, current_model_path=None, save_freq=5):
@@ -146,8 +150,8 @@ class  Trainer:
             images, curr_sem, curr_inst, prev_inst = [b.to(self.device) for b in batch]
 
             with torch.no_grad():
-                heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights = \
-                    self.gpu_target_gen.generate(curr_inst, prev_inst)
+                heatmaps, prev_heatmaps, center_offsets, motion_offsets, offset_weights, center_weights = \
+                    self.gpu_target_gen.generate(curr_sem, curr_inst, prev_inst)
 
             targets = {
                 'semantic_masks': curr_sem,
@@ -159,7 +163,7 @@ class  Trainer:
             # Forward and Loss Calculation
             with autocast(device_type='cuda'):
                 predictions = self.model(images, gt_prev_heatmap=prev_heatmaps)
-                total_loss, _, _, _, _ = compute_loss(predictions, targets, offset_weights)
+                total_loss, _, _, _, _ = compute_loss(predictions, targets, offset_weights, center_weights)
             
             # Synchronize outside of mixed precision context
             loss_value = total_loss.item()

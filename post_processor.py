@@ -31,7 +31,7 @@ class PanopticPostProcessor(nn.Module):
 
         for i in range(B):
             sem = semantic_pred[i]
-            heat = center_heatmap[i:i+1]
+            heat = torch.sigmoid(center_heatmap[i:i+1])
             offset = offset_map[i]
 
             heat_thresh = torch.where(heat > self.center_threshold, heat, torch.zeros_like(heat))
@@ -72,6 +72,7 @@ class PanopticPostProcessor(nn.Module):
             panoptic_map = torch.ones_like(sem) * self.void_label * self.label_divisor
             
             # 3a. Paste 'Thing' instances with majority-vote semantic classes
+            num_instance_per_sem = {int(c.item()): 0 for c in self.thing_class_ids}
             for inst_id in torch.unique(instance_map):
                 if inst_id == 0: continue
                 inst_mask = (instance_map == inst_id)
@@ -79,8 +80,12 @@ class PanopticPostProcessor(nn.Module):
                 
                 if len(sem_classes_in_inst) == 0: continue
                 
-                majority_class = torch.mode(sem_classes_in_inst).values
-                panoptic_map[inst_mask] = (majority_class * self.label_divisor) + inst_id
+                majority_class = torch.mode(sem_classes_in_inst).values.item()
+                if majority_class not in self.thing_class_ids: continue
+                
+                num_instance_per_sem[majority_class] += 1
+                new_instance_id = num_instance_per_sem[majority_class]
+                panoptic_map[inst_mask] = (majority_class * self.label_divisor) + new_instance_id
             
             # 3b. Paste 'Stuff' regions (filtering out small disconnected regions)
             stuff_mask = (instance_map == 0)
@@ -235,7 +240,7 @@ class MotionTracker:
             
         if len(final_centers) > 0:
             final_centers[:, 4] += 1
-            final_centers = final_centers[final_centers[:, 4] <= self.sigma_track] # Kill old ones
+            final_centers = final_centers[final_centers[:, 4] < self.sigma_track] # Kill old ones
             
         self.prev_centers = final_centers
         return new_panoptic_map
