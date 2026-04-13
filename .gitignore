@@ -2,6 +2,7 @@ images/
 panoptic_maps/
 dl_env/
 motion-deeplab.py
+official_postprocess.py
 
 weights/*
 !weights/motion_deeplab_epoch_90.pth

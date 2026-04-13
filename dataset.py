@@ -11,7 +11,7 @@ import random
 
 
 class JointPreprocessor:
-    def __init__(self, crop_size=(384, 1248), is_training=True, ignore_label=255):
+    def __init__(self, crop_size=(385, 1249), is_training=True, ignore_label=255):
         self.crop_size = crop_size
         self.is_training = is_training
         self.ignore_label = ignore_label
@@ -81,12 +81,12 @@ class TargetGenerator:
         instance_map[~is_thing] = 0
 
         is_crowd = is_thing & (instance_map == 0)
-        instance_map[is_crowd] = self.ignore_label
+        instance_map[is_crowd] = 0
         
         return torch.from_numpy(semantic_map).long(), torch.from_numpy(instance_map).long()
 
 class KittiStepDataset(Dataset):
-    def __init__(self, root_dir, split='train', image_size=(384, 1248)):
+    def __init__(self, root_dir, split='train', image_size=(385, 1249)):
         """
         Args:
             root_dir: Path to KITTI_STEP_ROOT
