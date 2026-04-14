@@ -2,7 +2,7 @@
 
 A PyTorch exploration of Google's [Motion-DeepLab](https://arxiv.org/pdf/2102.11859), built as a university course project to understand the mechanics of video panoptic segmentation. 
 
-Video panoptic segmentation is a complex, multi-stage problem. The goal of this project was not to beat state-of-the-art benchmarks, but to deconstruct a highly complex architecture to see how it works under the hood. While the original paper evaluates several single-frame baselines, we chose to reproduce their multi-frame Motion-DeepLab as it offered a more complete architecture and better documentation.
+Video panoptic segmentation is a complex, multi-stage problem. The goal of this project was to get familiar with the task by deconstructing a modern vps architeture. While the original paper evaluates several single-frame baselines, we chose to reproduce their multi-frame Motion-DeepLab as it offered a more complete picture of the problem and better documentation to work with.
 ---
 
 ## Table of Contents
@@ -52,8 +52,8 @@ Motion-DeepLab was built as one of the baselines to prove this new benchmark. It
 - **7-channel input**: current RGB frame (3ch) + previous RGB frame (3ch) + previous-frame center heatmap (1ch)
 - **Dual-decoder architecture**: separate decoders for semantic and instance tasks
 - **Four prediction heads**: semantic logits, center heatmap, center offsets, motion offsets
-- **GPU-accelerated post-processing**: panoptic decoding and heatmap rendering on CUDA
-- **Two tracking backends**: official DeepLab2-aligned tracker & IoU-based Hungarian tracker
+- **Post-processing**: panoptic decoding and heatmap rendering
+- **Two tracking backends**: official DeepLab2-aligned tracker
 - **Two-stage training**: Cityscapes pretraining → KITTI-STEP fine-tuning
 - **Mixed precision training** with gradient accumulation for large effective batch sizes
 
@@ -150,7 +150,7 @@ All head outputs are bilinearly upsampled to input resolution. Offset prediction
 
 ### Stage 1 — Cityscapes Pretraining
 
-Warm-up the encoder and decoders on the larger [Cityscapes](https://www.cityscapes-dataset.com/) dataset before fine-tuning on KITTI-STEP.
+Since Video Panoptic Segmentation extends Panoptic Segmentation, the problem can be reduced to fine-tuning a model designed for static images. While the original work pretrains the model on both Cityscapes and Mapillary Vistas using extensive data augmentation, our implementation obly pretrained the model on Cityscapes with only some of the data augmentation techniques.
 
 - **Dataset**: Cityscapes `train` split (~2,975 images)
 - **Mode**: Full-branch panoptic pretrain (semantic + center heatmap + center offset)
@@ -161,7 +161,7 @@ Warm-up the encoder and decoders on the larger [Cityscapes](https://www.cityscap
 ### Stage 2 — KITTI-STEP Fine-tuning
 
 - **Dataset**: KITTI-STEP `train` split (21 video sequences, ~8K pairs)
-- **Input**: Consecutive frame pairs + auto-generated previous-frame center heatmap
+- **Input**: Consecutive frame pairs + previous-frame center heatmap
 - **Epochs**: 200 (configurable)
 - **Resume**: Initializes from Cityscapes pretrained checkpoint
 
@@ -224,8 +224,6 @@ L_total = L_semantic
 
 ### Panoptic Decoding
 
-Native PyTorch post-processing aligned with the official DeepLab2 pipeline
-
 1. **Semantic prediction**: argmax over 19-class logits
 2. **Center detection**: sigmoid activation → threshold (default 0.1) → NMS with 13×13 max-pool → top-K retention (K=200)
 3. **Instance grouping**: each pixel assigned to closest detected center via predicted offsets (Vectorized tensor argmin over all center candidates)
@@ -280,58 +278,6 @@ Per-sequence breakdown (val split, 9 sequences):
 | 0016 | 209 | 0.339 | 0.229 | 0.503 |
 | 0018 | 339 | 0.437 | 0.479 | 0.398 |
 
----
-
-## Project Structure
-
-```
-autonomous-visual-planning-project-latest/
-│
-├── model.py                     # Full model: ResNet50 encoder + dual decoder + multi-head
-├── train.py                     # KITTI-STEP training loop (main training script)
-├── train_cityscapes.py          # Cityscapes pretraining (semantic + instance)
-├── dataset.py                   # KITTI-STEP dataset with paired-frame loading
-├── dataset_cityscapes.py        # Cityscapes dataset (semantic + panoptic modes)
-├── cityscapes_labels.py         # Cityscapes labelId → trainId mapping LUT
-├── loss.py                      # All loss functions + ground truth generation
-├── eval.py                      # Visualization: 2×2 grid PNG + MP4 video
-├── run_step_eval.py             # STQ/AQ/IoU evaluation pipeline
-├── official_postprocess.py      # GPU-accelerated panoptic decoding + motion tracking
-├── tracking.py                  # IoU-based Hungarian tracker (legacy)
-├── stq_metric.py                # STQ metric (numpy, aligned with DeepLab2)
-├── submit_full_pipeline.sh      # Pipeline submission wrapper
-│
-├── scripts/
-│   ├── download_cityscapes.sh       # Official Cityscapes download (account required)
-│   ├── download_cityscapes_kaggle.sh # Cityscapes via Kaggle mirror
-│   └── rclone_upload_drive.sh       # Upload checkpoints to Google Drive
-│
-├── run_full_pipeline_single_job.sbatch  # End-to-end: pretrain → train → eval → viz
-├── run_resume_pipeline.sbatch           # Resume training from checkpoint
-├── run_train_h200.sbatch                # KITTI training on H200 GPU
-├── run_train_v100_32g.sbatch            # KITTI training on V100 32GB
-├── run_train_v100_16g.sbatch            # KITTI training on V100 16GB
-├── run_train_cityscapes.sbatch          # Cityscapes pretraining job
-├── run_eval_stq_full.sbatch             # Full STQ evaluation job
-├── run_eval_stq_grid.sbatch             # Hyperparameter grid search for eval
-├── run_eval_only.sbatch                 # Quick evaluation job
-├── run_eval_video.sbatch                # Video visualization job
-├── run_vis_all.sbatch                   # Visualize all sequences
-│
-├── images/                  # Symlink to KITTI-STEP images (train/val)
-├── panoptic_maps/           # Symlink to KITTI-STEP panoptic GT (train/val)
-├── weights/                 # Cityscapes pretrained checkpoints
-├── outputs/                 # Evaluation results, Slurm logs, visualizations
-│   ├── stq_*.json           # STQ evaluation results
-│   ├── evaluation_result.png # Visualization sample
-│   └── evaluation_video.mp4  # Video visualization
-│
-├── .gitignore
-└── README.md
-```
-
----
-
 ## Setup & Usage
 
 ### Prerequisites
@@ -341,7 +287,7 @@ autonomous-visual-planning-project-latest/
 - torchvision
 - OpenCV (`cv2`)
 - NumPy, SciPy
-- A GPU with ≥16 GB VRAM (V100 16GB minimum; V100 32GB or H200 recommended)
+- A GPU with ≥8 GB VRAM
 
 Install dependencies (if not using a pre-built environment module):
 
@@ -381,153 +327,7 @@ project_root/
 Panoptic maps are 3-channel PNGs where:
 - **Channel R** = semantic class ID (0–18, 255=ignore)
 - **Channels G×256 + B** = instance ID (0=stuff/background)
-
-#### Cityscapes (for pretraining)
-
-Download via official website or Kaggle mirror:
-
-```bash
-# Option 1: Official download (requires account)
-export CITYSCAPES_USERNAME='your_login'
-export CITYSCAPES_PASSWORD='your_password'
-export CITYSCAPES_DEST=/path/to/cityscapes
-bash scripts/download_cityscapes.sh
-
-# Option 2: Kaggle mirror
-bash scripts/download_cityscapes_kaggle.sh
-```
-
-Required directory structure:
-```
-cityscapes/
-├── leftImg8bit/
-│   ├── train/
-│   └── val/
-└── gtFine/
-    ├── train/
-    └── val/
-```
-
-### Training
-
-#### Stage 1: Cityscapes Pretraining
-
-```bash
-python train_cityscapes.py \
-  --data_root /path/to/cityscapes \
-  --split train \
-  --panoptic \
-  --epochs 50 \
-  --batch_size 4 \
-  --accumulation_steps 4 \
-  --lr 1e-4 \
-  --lr_schedule poly \
-  --aux_semantic_weight 0.4 \
-  --top_k_percent 0.2 \
-  --save_dir weights \
-  --save_every 10
-```
-
-#### Stage 2: KITTI-STEP Fine-tuning
-
-```bash
-python train.py \
-  --data_root . \
-  --resume \
-  --resume_ckpt weights/motion_deeplab_cityscapes_epoch_50.pth \
-  --start_epoch 1 \
-  --epochs 200 \
-  --batch_size 4 \
-  --accumulation_steps 4 \
-  --lr 1e-4 \
-  --lr_schedule poly \
-  --aux_semantic_weight 0.4 \
-  --center_loss_weight 200.0 \
-  --offset_loss_weight 0.01 \
-  --motion_loss_weight 0.01 \
-  --top_k_percent 0.2 \
-  --small_instance_weight 3.0 \
-  --save_dir . \
-  --save_every 10
-```
-
-### Evaluation
-
-Run STQ evaluation on the validation set:
-
-```bash
-# Official tracking (recommended)
-python run_step_eval.py \
-  --data_root . \
-  --split val \
-  --ckpt motion_deeplab_epoch_200.pth \
-  --postprocess official \
-  --label_divisor 1000 \
-  --nms_kernel 13 \
-  --track_sigma 9 \
-  --output_json outputs/stq_results.json
-
-# Legacy IoU tracker
-python run_step_eval.py \
-  --data_root . \
-  --split val \
-  --ckpt motion_deeplab_epoch_200.pth \
-  --postprocess legacy \
-  --label_divisor 1000 \
-  --output_json outputs/stq_results_legacy.json
-```
-
-### Visualization
-
-Generate a 2×2 grid visualization (Input | Semantic | Center Heatmap | Motion):
-
-```bash
-python eval.py \
-  --data_root . \
-  --ckpt motion_deeplab_epoch_200.pth \
-  --sequence 0002 \
-  --num_frames 200 \
-  --fps 5 \
-  --output_dir outputs
-```
-
-Outputs:
-- `outputs/evaluation_result_0002.png` — single-frame 2×2 grid snapshot
-- `outputs/evaluation_video_0002.mp4` — full sequence video
-
-### Full Pipeline (Single Job)
-
-Run the complete pipeline end-to-end:
-
-```bash
-export CITYSCAPES_ROOT=/path/to/cityscapes
-sbatch run_full_pipeline_single_job.sbatch
-```
-
-This sequentially runs: Cityscapes pretrain (50 epochs) → KITTI-STEP training (200 epochs) → STQ evaluation (official + legacy) → visualization.
-
----
-
-## Slurm Cluster Usage
-
-Multiple Slurm batch scripts are provided for HPC environments:
-
-| Script | GPU | Purpose |
-|--------|-----|---------|
-| `run_full_pipeline_single_job.sbatch` | H200 141GB | Complete pipeline |
-| `run_train_h200.sbatch` | H200 141GB | KITTI-STEP training only |
-| `run_train_v100_32g.sbatch` | V100 32GB | KITTI-STEP training |
-| `run_train_v100_16g.sbatch` | V100 16GB | KITTI-STEP training |
-| `run_train_cityscapes.sbatch` | V100 32GB | Cityscapes pretraining |
-| `run_resume_pipeline.sbatch` | H200 141GB | Resume interrupted training |
-| `run_eval_stq_full.sbatch` | V100 32GB | Full STQ evaluation |
-| `run_eval_stq_grid.sbatch` | V100 32GB | Hyperparameter grid search |
-| `run_eval_video.sbatch` | V100 32GB | Video visualization |
-
-All scripts assume the `scicomp-python-env` module with PyTorch and torchvision. Adjust module loads for your cluster.
-
----
-
+- 
 ## References
 
 1. **Motion-DeepLab**: Weber, M., et al. (2021). *STEP: Segmenting and Tracking Every Pixel*. NeurIPS 2021 Datasets and Benchmarks Track. [arXiv:2104.14462](https://arxiv.org/pdf/2102.11859)
