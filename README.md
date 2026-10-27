@@ -1,5 +1,7 @@
 # Motion-DeepLab: Video Panoptic Segmentation on KITTI-STEP
 
+![Video panoptic segmentation result](outputs/segmentation_demo.gif)
+
 A PyTorch exploration of Google's [Motion-DeepLab](https://arxiv.org/pdf/2102.11859), built as a university course project to understand the mechanics of video panoptic segmentation. 
 
 Video panoptic segmentation is a complex, multi-stage problem. The goal of this project was to get familiar with the task by deconstructing a modern vps architeture. While the original paper evaluates several single-frame baselines, we chose to reproduce their multi-frame Motion-DeepLab as it offered a more complete picture of the problem and better documentation to work with.
